@@ -204,6 +204,24 @@ For example:
 python -m olmocr.pipeline s3://my_s3_bucket/pdfworkspaces/exampleworkspace --pdfs s3://my_s3_bucket/jakep/gnarly_pdfs/*.pdf --beaker --beaker_gpus 4
 ```
 
+### Running on Windows
+
+Install Python 3.11 and add [Poppler](https://github.com/oschwartz10612/poppler-windows/releases/) to `PATH`.
+Then install olmOCR with GPU extras:
+
+```bash
+pip install olmocr[gpu]
+```
+
+Run the pipeline:
+
+```bash
+python -m olmocr.pipeline C:\workspace --pdfs C:\docs\*.pdf --markdown
+```
+
+To use a remote model via [OpenRouter](https://openrouter.ai) provide `--openrouter_model` and your API key with `--openrouter_api_key` or the `OPENROUTER_API_KEY` environment variable.
+
+
 ### Using Docker
 
 Pull the Docker image.
