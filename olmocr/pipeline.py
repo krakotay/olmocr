@@ -21,6 +21,8 @@ from functools import cache, partial
 from io import BytesIO
 from urllib.parse import urlparse
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 import boto3
 import httpx
 import torch
@@ -93,6 +95,10 @@ get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, No
 # Specify a default port, but it can be overridden by args
 SGLANG_SERVER_PORT = 30024
 
+# Set by CLI when using OpenRouter
+OPENROUTER_API_KEY = None
+OPENROUTER_MODEL = None
+
 
 @dataclass(frozen=True)
 class PageResult:
@@ -132,8 +138,9 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
         # Encode the rotated image back to base64
         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+    model_name = OPENROUTER_MODEL if OPENROUTER_MODEL is not None else "Qwen/Qwen2-VL-7B-Instruct"
     return {
-        "model": "Qwen/Qwen2-VL-7B-Instruct",
+        "model": model_name,
         "messages": [
             {
                 "role": "user",
@@ -214,7 +221,10 @@ async def apost(url, json_data):
 
 
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
-    COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
+    use_openrouter = OPENROUTER_MODEL is not None
+    COMPLETION_URL = (
+        OPENROUTER_URL if use_openrouter else f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
+    )
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 0.1, 0.8]
     FORCE_NO_DOCUMENT_ANCHORING_BY_ATTEMPT = [False, False, False, False, False, False, True, True]
@@ -240,7 +250,18 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
 
         try:
-            status_code, response_body = await apost(COMPLETION_URL, json_data=query)
+            if use_openrouter:
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://github.com/allenai/olmocr",
+                    "X-Title": "olmocr",
+                }
+                async with httpx.AsyncClient(timeout=300) as client:
+                    resp = await client.post(COMPLETION_URL, json=query, headers=headers)
+                    status_code = resp.status_code
+                    response_body = resp.text
+            else:
+                status_code, response_body = await apost(COMPLETION_URL, json_data=query)
 
             if status_code == 400:
                 raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
@@ -567,7 +588,7 @@ async def sglang_server_task(model_name_or_path, args, semaphore):
     mem_fraction_arg = ["--mem-fraction-static", "0.80"] if gpu_memory < 60 else []
 
     cmd = [
-        "python3",
+        sys.executable,
         "-m",
         "sglang.launch_server",
         "--model-path",
@@ -1001,6 +1022,10 @@ async def main():
     parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1024)
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
+    # OpenRouter options
+    parser.add_argument("--openrouter_model", type=str, default=None, help="Run inference using OpenRouter with the given model name")
+    parser.add_argument("--openrouter_api_key", type=str, default=None, help="API key for OpenRouter (or set OPENROUTER_API_KEY environment variable)")
+
     # Beaker/job running stuff
     parser.add_argument("--beaker", action="store_true", help="Submit this job to beaker instead of running locally")
     parser.add_argument("--beaker_workspace", help="Beaker workspace to submit to", default="ai2/olmocr")
@@ -1018,6 +1043,9 @@ async def main():
     # set the global SGLANG_SERVER_PORT from args
     global SGLANG_SERVER_PORT
     SGLANG_SERVER_PORT = args.port
+    global OPENROUTER_API_KEY, OPENROUTER_MODEL
+    OPENROUTER_MODEL = args.openrouter_model
+    OPENROUTER_API_KEY = args.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
 
     # setup the job to work in beaker environment, load secrets, adjust logging, etc.
     if "BEAKER_JOB_NAME" in os.environ:
@@ -1132,14 +1160,17 @@ async def main():
         submit_beaker_job(args)
         return
 
-    # If you get this far, then you are doing inference and need a GPU
-    check_sglang_version()
-    check_torch_gpu_available()
+    # If you get this far, then you are doing inference
+    if OPENROUTER_MODEL is None:
+        check_sglang_version()
+        check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
     # Download the model before you do anything else
-    model_name_or_path = await download_model(args.model)
+    model_name_or_path = None
+    if OPENROUTER_MODEL is None:
+        model_name_or_path = await download_model(args.model)
 
     # Initialize the work queue
     qsize = await work_queue.initialize_queue()
@@ -1151,11 +1182,13 @@ async def main():
     # We only allow one worker to move forward with requests, until the server has no more requests in its queue
     # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
+
     semaphore = asyncio.Semaphore(1)
 
-    sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
-
-    await sglang_server_ready()
+    sglang_server = None
+    if OPENROUTER_MODEL is None:
+        sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
+        await sglang_server_ready()
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
@@ -1171,7 +1204,8 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
-    sglang_server.cancel()
+    if sglang_server:
+        sglang_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
 
